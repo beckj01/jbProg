@@ -81,6 +81,10 @@ export const postAPI = {
         method: "POST", 
         body: JSON.stringify(postData),
     }),
+    update: (id, postData) => apiRequest(`/posts/${id}`, {
+        method: "PUT",
+        body: JSON.stringify(postData)
+    }),
 
     delete: (id) => apiRequest(`/posts/${id}`, {
         method: "DELETE",
