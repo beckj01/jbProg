@@ -3,7 +3,7 @@ import {postAPI, userAPI} from '../services/api'
 
 export default function PostsView() {
     const [posts, setPosts] = useState([])
-    const [currentUser, setCurrentUser] = useState([])
+    const [currentUser, setCurrentUser] = useState(null)
     const [loading, setLoading] = useState(true)
     const [error, setError] = useState(null)
     const [searchQuery, setSearchQuery] = useState("")
@@ -18,17 +18,57 @@ export default function PostsView() {
     const [published, setPublished] = useState(true)
 
     const [editingPost, setEditingPost] = useState(null)
+    const [viewMode, setViewMode] = useState("all") // 'all' or 'me'
+    const [skip, setSkip] = useState(0)
+    const [hasMore, setsHasMore] = useState(true)
+    const LIMIT = 10
 
 
-    const fetchPosts = async (search = '') => {
+    const fetchPosts = async (search = '', reset = false) => {
         try {
             setLoading(true)
+            const currentSkip = reset ? 0 : skip
+
             const [postData, meData] = await Promise.all([
-            postAPI.getAll(search),
+                viewMode === 'me'
+                ? postAPI.getMyPosts()
+                : postAPI.getAll(search, LIMIT, currentSkip),            
             userAPI.getCurrentUser().catch(() => null)
+
             ])
-            setPosts(postData)
+
+            if (reset || viewMode === 'me') {
+                setPosts(postData)
+                setSkip(LIMIT)
+            } else {
+                setPosts(prev => {
+                    // check to filter out any incoming posts that are already in the state variable
+                    const existingIds = new Set(prev.map(item => (item.Post || item).id)) 
+                    const uniqueNewPosts = postData.filter(item => !existingIds.has((item.Post ||item).id))
+                    return [...prev, ...uniqueNewPosts]
+                })
+                setSkip(prevSkip => prevSkip + LIMIT)
+            }
+
             setCurrentUser(meData)
+            
+            // Disable Load more if viewing 'me' (since it returns all at once) or if fewer items return
+            if (viewMode === 'me' || postData.length < LIMIT) {
+                setsHasMore(false)
+            } else {
+                setsHasMore(true)
+            }            
+
+            // seed liked posts state
+            if (postData) {
+                setLikedPosts(prev => {
+                    const updated = new Set(prev)
+                    postData.forEach(item => {
+                        if (item.user_voted) updated.add((item.Post || item).id)
+                    })
+                    return updated
+                })
+            }
         } catch (err) {
             setError(err.message);
         } finally {
@@ -37,12 +77,14 @@ export default function PostsView() {
     }
 
     useEffect(() => {
-        fetchPosts()
-    }, [])
+        setsHasMore(viewMode === 'all')
+        fetchPosts(searchQuery, true)
+    }, [viewMode])
 
     const handleSearchSubmit = (e) => {
         e.preventDefault()
-        fetchPosts(searchQuery)
+        setsHasMore(true)
+        fetchPosts(searchQuery, true)
     }
 
 
@@ -50,29 +92,48 @@ export default function PostsView() {
         const isCurrentlyLiked = likedPosts.has(postId)
         // if already liked, direction 0 removes the vote. If not liked, direction 1 adds a vote
         const newDirection = isCurrentlyLiked ? 0 : 1
+        
+        // optimistically update local 'likedPosts' set immediately for snappy UI
+        const updatedLikes = new Set(likedPosts)
+        if (isCurrentlyLiked) {
+            updatedLikes.delete(postId)
+        } else {
+            updatedLikes.add(postId)
+        }
+        setLikedPosts(updatedLikes)
+
+        // optimistically update the vote count and user_voted flag in the local posts array
+        setPosts(prevPosts =>
+            prevPosts.map(item => {
+                const post = item.Post || item
+                if (post.id === postId) {
+                    const currentVotes = item.votes !== undefined ? item.votes : 0
+                    const newVotes = isCurrentlyLiked ? Math.max(0, currentVotes - 1) : currentVotes + 1
+                    
+                    return {
+                        ...item,
+                        votes: newVotes,
+                        user_voted: !isCurrentlyLiked
+                    }
+                }
+            return item
+            })
+        )
+
         try {
             await postAPI.vote(postId, newDirection)
-
-            // update local tracking set for UI feedback
-            const updatedLikes = new Set(likedPosts)
-            if (isCurrentlyLiked) {
-                updatedLikes.delete(postId)
-            } else {
-                updatedLikes.add(postId)
-            }
-            setLikedPosts(updatedLikes)
-
-            // refresh post list to pull updated vote counts aggregated from the DB
-            fetchPosts(searchQuery)
-
         } catch (err) {
-            // if backend returns a 409 conflict (already voted), sync local state
-            if (err.message.includes("already voted")) {
-                const updatedLikes = new Set(likedPosts)
+            // if backend call fails, revert the local changes back
+            if (isCurrentlyLiked) {
                 updatedLikes.add(postId)
-                setLikedPosts(updatedLikes)
+            } else {
+                updatedLikes.delete(postId)
             }
-            alert(`${err.message}`)
+            setLikedPosts(new Set(updatedLikes))
+
+            // revert vote count locally or refetch on error
+            fetchPosts(searchQuery, true)
+            alert(`Failed to update vote: ${err.message}`)
         }
     }
 
@@ -83,7 +144,7 @@ export default function PostsView() {
             setTitle('')
             setContent('')
             setShowCreateModal(false)
-            fetchPosts(searchQuery)
+            fetchPosts(searchQuery, true)
         } catch (err) {
             alert(`Error creating post: ${err.message}`)
         }
@@ -98,7 +159,7 @@ export default function PostsView() {
                 published: editingPost.published,
             })
             setEditingPost(null)
-            fetchPosts(searchQuery)
+            fetchPosts(searchQuery, true)
         } catch (err) {
             alert(`Error updating post: ${err.message}`)
         }
@@ -108,30 +169,55 @@ export default function PostsView() {
         if (!confirm("Are you sure you want to delete this post?")) return
         try {
             await postAPI.delete(postID)
-            fetchPosts(searchQuery)
+            fetchPosts(searchQuery, true)
         } catch (err) {
             alert (`Error deleting post: ${err.message}`)
         }
     }
+
+    // filter posts by view mode, if view mode 'all' show all published posts and only drafts of the current user
+    const filteredPosts = posts
 
 
     if (loading && posts.length === 0) return <div className="text-center py-20 text-gray-400">Loading posts...</div>
     if (error) return <div className="text-center py-20 text-red-400">Error: {error}</div>
 
     return (
-    <div className="max-w-5xl mx-auto py-8 px-4">
+    <div className="max-w-5xl mx-auto py-2 px-2">
         {/* Header & Controls */}
-        <div className="flex flex-col md:flex-row justify-between items-center mb-8 gap-4">
+        <div className="flex flex-col md:flex-row justify-between items-center mb-3 gap-4">
             <div>
                 <h2 className="text-2xl font-bold text-gray-100 tracking-wide">Posts</h2>
                 <p className="text-sm text-gray-400 mt-1">A space to share community posts</p>
             </div>
-            <button
-                onClick={() => setShowCreateModal(true)}
-                className="bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-medium px-5
-                    py-2 rounded-xl transition-colors shadow-lg shadow-indigo-950/50 cursor-pointer">
-                + Create Post
-            </button>
+            <div>
+                <button
+                    onClick={() => setShowCreateModal(true)}
+                    className="bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-medium px-5
+                        py-2 rounded-xl transition-colors shadow-lg shadow-indigo-950/50 cursor-pointer">
+                    + Create Post
+                </button>
+                <div className= "flex items-center gap-2 mt-2 mb-2">
+                    <button type="button"
+                        onClick={() => setViewMode("all")}
+                        className={`p-1 rounded-xl text-xs font-medium transition-all cursor-pointer border ${
+                            viewMode === 'all'
+                            ? `bg-indigo-600 border-indigo-500 text-white shadow-lg shadow-indigo-950/50`
+                            : `bg-gray-900 border-gray-800 text-gray-400 hover:text-gray-200 hover:bg-gray-800`
+                        }`}>
+                        All Posts
+                    </button>
+                    <button type="button"
+                        onClick={() => setViewMode("me")}
+                        className={`p-1 rounded-xl text-xs font-medium transition-all cursor-pointer border ${
+                            viewMode === 'me'
+                            ? `bg-indigo-600 border-indigo-500 text-white shadow-lg shadow-indigo-950/50`
+                            : `bg-gray-900 border-gray-800 text-gray-400 hover:text-gray-200 hover:bg-gray-800`
+                        }`}>
+                        My Posts
+                    </button>
+                </div>
+            </div>
         </div>
 
         {/* Search Bar */}
@@ -140,7 +226,7 @@ export default function PostsView() {
                 type="text"
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder="Search posts by title..."
+                placeholder="Search posts..."
                 className="flex-1 bg-gray-900 border border-gray-800 text-gray-100 rounded-xl
                     px-4 py-3 text-sm focus:outline-non focusLborder-indigo-500 transition-all"
             />
@@ -154,7 +240,8 @@ export default function PostsView() {
                 <button type="button"
                     onClick={(() => {
                         setSearchQuery("")
-                        fetchPosts()
+                        setsHasMore(true)
+                        fetchPosts("", true)
                     })}
                     className="inline-flex items-center p-2 bg-gray-800 hover:bg-rose-950/40 hover:border-rose-800 hover:text-rose-300 rounded-xl
                         text-gray-200 text-sm font-medium transition-colors cursor-pointer border border-gray-700">
@@ -168,13 +255,14 @@ export default function PostsView() {
 
         {/* Posts Grid */}
         <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-            {posts.map((item) => {
+            {filteredPosts.map((item) => {
                 const post = item.Post || item
                 const votes = item.votes !== undefined ? item.votes : 0
                 const isLiked = likedPosts.has(post.id)
 
-                // check if current logged-in user owns this post
+                // check if current logged-in user owns this post & only display drafts for the current user
                 const isOwner = currentUser && currentUser.id === post.owner_id
+                const displayPost = currentUser.id === post.owner_id || post.published
 
                 return (
                     <div key={post.id} 
@@ -257,6 +345,26 @@ export default function PostsView() {
                 )
             })}
         </div>
+
+        {/* Load More Button */}
+        {hasMore && posts.length > 0 && (
+            <div className="text-center mt-8">
+                <button
+                    type="button"
+                    onClick={() => fetchPosts(searchQuery, false)}
+                    disabled={loading}
+                    className="px-6 py-3 bg-gray-800 hover:bg-gray-700 terxt-gray-200 text-sm font-medium rounded-xl
+                        transition-colors cursor-pointer border boder-gray-700 disabled:opacity-50">
+                    {loading ? "Loading..." : "Load More Posts"}
+                </button>
+            </div>
+        )}
+
+        {!hasMore && posts.length > 0 && (
+            <div className="text-center mt-8 text-xs text-gray-500">
+                You've reach the end of the posts.
+            </div>
+        )}
 
         {posts.length === 0 && !loading && (
             <div className="text-center py-16 bg-gray-900 border bodrer-gray-800 rounded-2xl text-gray-400 text-sm">
